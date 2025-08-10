@@ -1,0 +1,181 @@
+---
+title: "Data Exploration Project"
+format: 
+  docx:
+    echo: true
+editor: visual
+---
+
+## Introduction
+
+The following exploratory exercise looks at the College Scorecard, which was released at the start of September 2015. The question is simple: did this new information push people toward colleges with higher earnings? One way to find out is to watch what people search for online. Google Trends shows how often certain schools are searched over time. It is a window into public attention.
+
+This study links those search trends with College Scorecard earnings data. It looks at how a federal push for transparency might change behavior. And it asks if knowing about economic outcomes can steer students toward some schools and away from others.
+
+## Data preparation
+
+```{r, warning=FALSE, message=FALSE}
+# loads all the required libraries
+library(rio)
+library(tidyverse)
+library(vtable)
+library(fixest)
+library(lubridate)
+library(stringr)
+```
+
+```{r,  warning=FALSE, message=FALSE}
+# imports College Scorecard
+scorecard <- import("Lab3_RawData/Most+Recent+Cohorts+(Scorecard+Elements).csv")
+
+# imports College Scorecard data dictionary
+scorecard_dict <- import("Lab3_RawData/CollegeScorecardDataDictionary-09-08-2015.csv")
+
+# imports ID-name link
+id_name_link <- import("Lab3_RawData/id_name_link.csv")
+
+# Imports and combine all Google Trends CSV files in one step
+trends_data <- import_list(
+  list.files(
+    "Lab3_RawData",
+    pattern = "trends_up_to_.*\\.csv",
+    full.names = TRUE
+  ),
+  rbind = TRUE,
+  setclass = "tbl_df"  # get a tibble
+)
+```
+
+```{r ,  warning=FALSE, message=FALSE}
+# converts back to the right formats
+trends_data <- trends_data %>%
+  mutate(schid = as.integer(schid),keynum = as.integer(keynum),
+    index = as.integer(index)
+  )
+# Filters out rows with schid missing after coercion
+trends_data <- trends_data %>%
+   filter(!is.na(schid))
+```
+
+```{r}
+# Join with id
+score_name <- id_name_link %>% 
+  full_join(scorecard, by = c("opeid" ="OPEID"))
+```
+
+```{r}
+# join trends
+# Now join with Scorename data by school name
+full_data <- trends_data %>%
+  inner_join(score_name, by = "schname") 
+```
+
+```{r}
+# Filters out all rows for those duplicated names, keeping only unique names
+full_data_unique_ <- full_data %>%
+  mutate(uniq = paste0(schname, monthorweek, sep = "-")) %>% 
+  distinct(uniq, .keep_all = TRUE)
+```
+
+## Research question
+
+My goal here is to answer the following question: Did the College Scorecard release (September 2015) shift Google search interest toward colleges with higher graduate earnings, relative to those with lower earnings?
+
+### Create key variables for the analysis
+
+I will create some key variables necessary for further analysis and answering our research question.
+
+To categorize colleges based on the earnings outcomes of their graduates, we used the median earnings of former students ten years after graduation as reported in the College Scorecard dataset (`md_earn_wne_p10-REPORTED-EARNINGS`). Specifically, I defined a “high-earning” college as any institution whose median earnings exceeded the median across all colleges in the dataset. Conversely, colleges with earnings at or below the overall median were categorized as “low-earning.”
+
+Formally, we calculated the cutoff value as follows:
+
+```{r,  warning=FALSE, message=FALSE}
+# defines earning
+# Converts median earnings to numeric
+full_data <- full_data_unique_ %>%
+  mutate(`md_earn_wne_p10-REPORTED-EARNINGS` =
+           parse_number(`md_earn_wne_p10-REPORTED-EARNINGS`))
+
+# Defines median cutoff (e.g., median of all schools in dataset)
+median_earnings <- median(as.numeric(full_data$`md_earn_wne_p10-REPORTED-EARNINGS`),
+                          na.rm = TRUE)
+
+# Binary variable: 1 if above median earnings, 0 if below or missing
+full_data <- full_data %>%
+  mutate(high_earning = ifelse(`md_earn_wne_p10-REPORTED-EARNINGS` >
+                                 median_earnings, 1, 0))
+
+```
+
+I will then define pre/post Scorecard release indicator using the `monthorweek` variable. We want to identify if the week is before or after September 2015. Since `monthorweek` looks like "2013-03-31 - 2013-04-06", extract the start date:
+
+```{r}
+# defines indicator
+full_data <- full_data %>%
+  mutate(
+    week_start = ymd(substr(monthorweek, 1, 10)),
+    post_scorecard = ifelse(week_start >= ymd("2015-09-01"), 1, 0)
+  )
+```
+
+## Implementing regression
+
+The study looked at each college, week by week. Every record showed how many times people searched for that college on Google in a given week. I kept the data this way. I did not group it by month or merge search terms. This kept the weekly changes alive, especially around the time the Scorecard came out.
+
+The dependent variable was the Google Trends search index. It measured weekly interest in each college. I made it comparable by subtracting the mean and dividing by the standard deviation.
+
+The key independent variables were:
+
+`high_earning`: was 1 if a college’s median earnings ten years after graduation were above the median for all colleges. It was 0 if not.
+
+`post_scorecard`: was 1 for weeks on or after September 1, 2015, when the College Scorecard came out. It was 0 before that date.
+
+The interaction `high_earning * post_scorecard` howed if high-earning colleges had a different change in search interest after the Scorecard release.
+
+```{r,  warning=FALSE, message=FALSE}
+# As numeric and standardization
+full_data <- full_data %>%
+  mutate(
+    index = as.numeric(index),
+    index_std = (index - mean(index, na.rm = TRUE)) / sd(index, na.rm = TRUE)
+  )
+# Run difference-in-differences with college and week fixed effects
+model <- feols( index ~ high_earning * post_scorecard | unitid + week_start, data = full_data, vcov = "hetero"
+)
+
+etable(model)
+```
+
+Standard errors were computed robust to heteroskedasticity e.g., vcov = "hetero".)
+
+According to the findings, the introduction of the College Scorecard significantly increased search activity on Google Trends for colleges with high-earning graduates by an average of a 2.063 point higher index relative to what it did for colleges with low-earning graduates, with a standard error of 0.0929. This result comes from the 2.063 coefficient estimate of the interaction term (high_earning x post_scorecard) estimated in my regression.
+
+This means that prospective students appear to have shifted their attention toward institutions with higher earnings outcomes, consistent with the hypothesis that making earnings more salient influences student behavior.
+
+```{r, warning=FALSE, message=FALSE, fig.width=8}
+# aggregate the trends
+agg_trends <- full_data %>%
+  filter(!is.na(high_earning)) %>% 
+  mutate(index_std = (index - mean(index, na.rm = TRUE)) /
+           sd(index, na.rm = TRUE)) %>% 
+  group_by(week_start, high_earning) %>%
+  summarize(mean_index = mean(index_std, na.rm = TRUE))
+# plots graph
+ggplot(agg_trends, aes(x = week_start, y = mean_index, color = factor(high_earning))) +
+  geom_line() +
+  geom_vline(xintercept = as.numeric(ymd("2015-09-01")), linetype = "dashed") +
+  labs(
+    title = "Google Search Interest Over Time",
+    y = "Mean Standardized Index",
+    color = "High Earnings"
+  ) +
+  theme_minimal()
+```
+
+From the graph, we see that generally, the standardized index of higher earning colleges was higher than that of the low earnings colleges supporting the result of the regression. However, it is also important to note some form of seasonality present in the trend of the searches suggesting some periods in the year often have higher search volume.
+
+## Conclusion 
+
+Using a difference-in-differences model with college and week fixed effects. After the Scorecard came out, search interest rose for colleges whose graduates earned more than the median ten years after enrollment. The increase was statistically significant. This means that showing earnings data can shape how students look for information. It can also shape how they judge the value of a school.
+
+But search is not the same as applying or enrolling. It does not show what happens in the long run. Future work could tie these search trends to real choices by students. It could study how effects differ for different groups. It could also look at how transparency changes the market for higher education.
